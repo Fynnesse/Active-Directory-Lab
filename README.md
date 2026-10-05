@@ -1,4 +1,4 @@
-# Active-Directory-Project
+# Active-Directory-Lab
 
 
 # Objective
