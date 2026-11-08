@@ -1,6 +1,9 @@
-## PowerShell execution policy to Bypass for the current user, allowing them to run any PowerShell scripts without restrictions or warnings:
-Code: Set-ExecutionPolicy Bypass CurrentUser
+## Allow scripts to run for the current user (lab only)
+Set-ExecutionPolicy Bypass -Scope CurrentUser
 
-## Atomic Red Team Powershell Command
-Code: https://raw.githubusercontent.com/redcanaryco/invoke-atomicredteam/master/install-atomicredteam.ps1. -UseBasicParsing);
-Code: Install-AtomicRedTeam -getAtomics
+## Install Invoke-AtomicRedTeam and download the atomic tests
+IEX (IWR 'https://raw.githubusercontent.com/redcanaryco/invoke-atomicredteam/master/install-atomicredteam.ps1' -UseBasicParsing);
+Install-AtomicRedTeam -getAtomics
+
+## Run the PowerShell atomics (MITRE ATT&CK T1059.001)
+Invoke-AtomicTest T1059.001

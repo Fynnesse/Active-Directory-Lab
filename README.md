@@ -1,55 +1,112 @@
-# Active-Directory-Lab
+# Active Directory Lab: Attacking a Domain and Finding It in Splunk
 
+**Date:** April 2024
 
-# Objective
+**Environment:** VirtualBox NAT network (192.168.10.0/24): Windows Server 2022 domain controller, Windows 10 domain member, Ubuntu running Splunk Enterprise 9.2.1, Kali Linux attacker
 
-The goal of this project was to construct a simulated, secure network environment and observe firsthand the dynamics of cyber threats and defenses. By establishing an Active Directory structure and integrating Splunk for event monitoring, the project aimed to offer a tangible understanding of how various cybersecurity tools interact and how potential intrusions can be detected and analyzed within a controlled setting. The overarching objective was to craft an insightful narrative that could be shared to help others learn about the nuances of network security through practical engagement.
+**Report type:** Lab build, attack simulation and log analysis
 
-# Skills Learned
+---
 
-- Network configuration and management.
-- Active Directory setup and user management.
-- Brute force attack methods and their signatures.
-- Event logging and monitoring.
-- Usage of the MITRE ATT&CK Framework for understanding threat models.
+## Summary
 
-# Tools Used
+I built a small Windows domain (`fynnesse.local`), sent Sysmon and Windows event logs from both Windows machines to Splunk, then attacked it from Kali and with Atomic Red Team to see what each attack looks like in the logs.
 
-- VirtualBox for virtualization.
-- Kali Linux for penetration testing.
-- Windows Server 2022 and Windows 10 for setting up a target environment.
-- Splunk for data aggregation and analysis.
-- Hydra and Atomic Red Team for simulating attacks.
+The telemetry pipeline worked. Both hosts reported into Splunk, and the Atomic Red Team PowerShell tests (T1059.001) showed up with full Sysmon detail: process, command line, parent process and user. The brute force leg did not go to plan. Crowbar failed to work through the wordlist, so I switched to Hydra. Neither the Hydra run nor the resulting failed logons are captured in this repo, and neither attack was turned into a saved alert. Both gaps are covered in [What didn't work](#what-didnt-work).
 
-# Steps Taken
-## Design and Visualization:
-- Developed a comprehensive logical diagram to establish a clear vision of the data flow and overall structure of the project.
+Built by following [MyDFIR's Active Directory series](https://www.youtube.com/@MyDFIR). The build, configuration and evidence below are from my own environment.
 
-## Virtual Environment Setup:
-- Deployed all required virtual machines to create a diverse and interactive network.
-- Executed network configuration to ensure all systems operate on the same NAT-Network, facilitating communication and internet access.
+---
 
-## IP Configuration and Monitoring Infrastructure:
-- Assigned static IP addresses to each virtual machine, adhering to the initial project design.
-- Installed and configured Splunk on Ubuntu, along with the Splunk Universal Forwarder and Sysmon on Windows platforms for event monitoring.
+## Architecture
 
-## Active Directory Installation and Configuration:
-- Installed Active Directory on Windows Server and promoted it to a domain controller to manage network resources securely and efficiently.
+![Network diagram](images/network-diagram.png)
 
-## Organizational Structure and Access Management:
-- Created organizational units representing different departments and provisioned user accounts, setting the stage for role-based access control.
+| Host | Role | IP | Telemetry |
+|---|---|---|---|
+| ADDC01 | Windows Server 2022 domain controller for `fynnesse.local` | 192.168.10.7 | Sysmon, Splunk Universal Forwarder |
+| TARGET-PC | Windows 10, joined to the domain | DHCP | Sysmon, Splunk Universal Forwarder |
+| Splunk | Ubuntu Server running Splunk Enterprise | 192.168.10.10 | Receives on 9997 |
+| Kali | Attacker | 192.168.10.250 | None |
 
-## Network Integration and Domain Connectivity:
-- Seamlessly integrated the target Windows machine into the domain, consolidating the network and enabling centralized management.
+The domain has users in their own organisational units (for example Winny Smith in IT), so the attacks run against real domain accounts.
 
-## Attack Simulation, Detection, and Learning:
-- Executed a brute force attack using Hydra to test network defenses.
-- Employed Splunk for the detection and analysis of attack patterns, facilitating a practical understanding of event logs and security breaches.
-- Utilized Atomic Red Team for further attack simulations, enhancing detection capabilities.
-- Expanded knowledge of key Windows event codes and the MITRE ATT&CK Framework, applying this to the threat simulation and detection processes.
+![AD users and OUs](images/ad-users-ou.png)
 
+---
 
-# Conclusion:
-The key takeaways from this project reinforce the notion that security is not a static field; it requires constant learning and adaptation. Tools and strategies must be continually evaluated and tested against emerging threats. The use of Hydra illustrated the critical need to select the right tools for specific scenarios, which could mean the difference between a breached and a secure system.
+## Telemetry pipeline
 
-Moreover, this project showcased that practical, hands-on projects serve as excellent learning conduits, significantly enhancing one's understanding and skills in cybersecurity.
+Both Windows machines forward four channels to a Splunk index called `endpoint`. Full file: [`Splunk-Input.conf`](Splunk-Input.conf)
+
+```ini
+[WinEventLog://Security]
+index = endpoint
+disabled = false
+
+[WinEventLog://Microsoft-Windows-Sysmon/Operational]
+index = endpoint
+disabled = false
+renderXml = true
+source = XmlWinEventLog:Microsoft-Windows-Sysmon/Operational
+```
+
+Application and System logs are also collected. Sysmon runs with [Olaf Hartong's sysmon-modular](https://github.com/olafhartong/sysmon-modular) config, which tags many events with ATT&CK technique IDs.
+
+**Checking the data was arriving.** Before attacking anything, I confirmed both hosts were reporting into the index (6,141 events over 24 hours):
+
+![Both hosts reporting into Splunk](images/splunk-hosts-reporting.png)
+
+---
+
+## Attack 1: RDP brute force
+
+**Setup:** I enabled Remote Desktop on TARGET-PC for both domain users. On Kali I took the first 20 entries from `rockyou.txt` and added the real password to the end, so the attack would eventually succeed.
+
+**What happened:** Crowbar didn't use the wordlist properly and produced no useful results. I switched to Hydra instead.
+
+**What it should look like in Splunk:** a burst of Event ID 4625 (failed logon) for one account from 192.168.10.250, followed by a 4624 (successful logon) when the right password lands. That pattern of many failures then a success is what separates an attack that worked from noise.
+
+```
+index=endpoint EventCode=4625
+| stats count by Account_Name, Source_Network_Address
+| where count > 10
+```
+
+That query is the alert I would build next. The 4625 evidence itself isn't captured in this repo.
+
+---
+
+## Attack 2: Atomic Red Team, T1059.001 PowerShell
+
+**Setup:** I installed Invoke-AtomicRedTeam on TARGET-PC and ran the PowerShell technique tests. Commands: [`Powershell-Commands`](Powershell-Commands)
+
+**What Splunk showed:** searching the index for PowerShell activity during the test window returned 286 events. The Sysmon records show the activity on `target-PC.fynnesse.local` under `FYNNESSE\Administrator`, with process paths under `C:\AtomicRedTeam\atomics\T1059.001`:
+
+![Atomic Red Team PowerShell activity in Splunk](images/splunk-atomic-powershell.png)
+
+**Why this matters:** it proves the telemetry is rich enough to build detections on. Sysmon gives the full command line and parent process, which is what you need to separate a download cradle from an admin running a script.
+
+---
+
+## What didn't work
+
+| Issue | What happened | Why it matters | Fix |
+|---|---|---|---|
+| Crowbar failed | It didn't iterate the wordlist and returned nothing | Lost time on tooling instead of the detection | Switched to Hydra. Test tools on a known-good target first |
+| Brute force evidence missing | No capture of the Hydra run or the 4625 events | The attack can't be checked against the logs from this repo | Re-run and capture the 4625 burst and the 4624 that follows |
+| No alerts built | Both attacks were found by searching after the fact, not by alerts | In a SOC, nobody is searching at the right moment | Save the 4625 threshold search above as an alert, and add one for PowerShell download cradles and encoded commands |
+
+---
+
+## Reproducing it
+
+- [Step by step guide (PDF)](Active-Directory-Lab-Guide.pdf)
+- [Project report (PDF)](Active%20Directory%20Project%20Report.pdf)
+- [Windows 10 and Sysmon setup](Windows-10-and-Sysmon-Setup)
+- [Splunk inputs.conf](Splunk-Input.conf)
+- [PowerShell commands](Powershell-Commands)
+
+**Tools:** Windows Server 2022, Active Directory, Splunk Enterprise, Splunk Universal Forwarder, Sysmon, Kali Linux, Crowbar, Hydra, Atomic Red Team, VirtualBox
+
+**Frameworks:** MITRE ATT&CK T1110.001 (Password Guessing), T1059.001 (PowerShell)
