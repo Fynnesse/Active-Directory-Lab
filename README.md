@@ -12,7 +12,9 @@
 
 I built a small Windows domain (`fynnesse.local`), sent Sysmon and Windows event logs from both Windows machines to Splunk, then attacked it from Kali and with Atomic Red Team to see what each attack looks like in the logs.
 
-The telemetry pipeline worked. Both hosts reported into Splunk, and the Atomic Red Team PowerShell tests (T1059.001) showed up with full Sysmon detail: process, command line, parent process and user. The brute force leg did not go to plan. Crowbar failed to work through the wordlist, so I switched to Hydra. Neither the Hydra run nor the resulting failed logons are captured in this repo, and neither attack was turned into a saved alert. Both gaps are covered in [What didn't work](#what-didnt-work).
+Both attacks showed up. The password attack against RDP succeeded: Splunk recorded a successful logon (Event ID 4624) for the domain user `wsmith` from the Kali machine. The Atomic Red Team PowerShell tests (T1059.001) showed up with full Sysmon detail: process, command line, parent process and user.
+
+What's missing: I didn't capture the burst of failed logons (4625) that came before the successful one, and neither attack was turned into a saved alert. Both are covered in [What didn't work](#what-didnt-work).
 
 Built by following [MyDFIR's Active Directory series](https://www.youtube.com/@MyDFIR). The build, configuration and evidence below are from my own environment.
 
@@ -29,9 +31,9 @@ Built by following [MyDFIR's Active Directory series](https://www.youtube.com/@M
 | Splunk | Ubuntu Server running Splunk Enterprise | 192.168.10.10 | Receives on 9997 |
 | Kali | Attacker | 192.168.10.250 | None |
 
-The domain has users in their own organisational units (for example Winny Smith in IT), so the attacks run against real domain accounts.
+The domain has two users: Winny Smith (`wsmith`) in the IT organisational unit, and Tope Smith (`tsmith`). TARGET-PC was joined to the domain so the attacks run against real domain accounts.
 
-![AD users and OUs](images/ad-users-ou.png)
+![TARGET-PC joining FYNNESSE.LOCAL](images/domain-join.png)
 
 ---
 
@@ -59,21 +61,35 @@ Application and System logs are also collected. Sysmon runs with [Olaf Hartong's
 
 ---
 
-## Attack 1: RDP brute force
+## Attack 1: Password attack against RDP
 
-**Setup:** I enabled Remote Desktop on TARGET-PC for both domain users. On Kali I took the first 20 entries from `rockyou.txt` and added the real password to the end, so the attack would eventually succeed.
+**Setup:** I allowed both domain users to log in over Remote Desktop on TARGET-PC.
 
-**What happened:** Crowbar didn't use the wordlist properly and produced no useful results. I switched to Hydra instead.
+![Remote Desktop users](images/rdp-users.png)
 
-**What it should look like in Splunk:** a burst of Event ID 4625 (failed logon) for one account from 192.168.10.250, followed by a 4624 (successful logon) when the right password lands. That pattern of many failures then a success is what separates an attack that worked from noise.
+On Kali I took the first 20 entries from `rockyou.txt` and added the real password to the end, so the attack would eventually succeed.
+
+![Building the wordlist on Kali](images/kali-wordlist.png)
+
+**What happened:** Crowbar didn't use the wordlist properly and produced no useful results, so I switched to Hydra.
+
+**What Splunk showed:** a successful logon for `FYNNESSE\wsmith` from workstation `kali` at `192.168.10.250`, authenticated with NTLM. That's the attacker getting in with a guessed password.
+
+![Successful logon for wsmith from Kali](images/splunk-4624-wsmith-from-kali.png)
+
+**Why this event gives it away:**
+
+- **Workstation name `kali`.** No legitimate machine in this domain is called that. In a real network, an unknown workstation name on a domain logon is worth a look on its own.
+- **NTLM, not Kerberos.** Domain-joined machines normally authenticate with Kerberos. An outside machine guessing passwords falls back to NTLM.
+- **The source IP is outside the expected set.** 192.168.10.250 isn't one of the domain's machines.
+
+**The alert I'd build:** a successful logon from the same source that just failed many times. That separates a brute force that worked from one that didn't.
 
 ```
-index=endpoint EventCode=4625
-| stats count by Account_Name, Source_Network_Address
-| where count > 10
+index=endpoint EventCode IN (4625, 4624)
+| stats count(eval(EventCode=4625)) AS failures, count(eval(EventCode=4624)) AS successes BY Account_Name, Source_Network_Address
+| where failures > 10 AND successes > 0
 ```
-
-That query is the alert I would build next. The 4625 evidence itself isn't captured in this repo.
 
 ---
 
@@ -85,7 +101,21 @@ That query is the alert I would build next. The 4625 evidence itself isn't captu
 
 ![Atomic Red Team PowerShell activity in Splunk](images/splunk-atomic-powershell.png)
 
-**Why this matters:** it proves the telemetry is rich enough to build detections on. Sysmon gives the full command line and parent process, which is what you need to separate a download cradle from an admin running a script.
+**Why this matters:** it proves the telemetry is rich enough to build detections on. Sysmon gives the full command line and parent process, which is what you need to tell a download cradle apart from an admin running a script.
+
+---
+
+## Build notes
+
+Two problems I hit while building the Splunk server:
+
+- **The shared folder wouldn't mount.** Adding my user to the `vboxsf` group failed because the group didn't exist. The VirtualBox guest utilities weren't installed. Installing `virtualbox-guest-utils` and rebooting fixed it.
+
+  ![vboxsf group error](images/vboxsf-error.png)
+
+- **Splunk came up on the wrong IP.** The server took a DHCP address (192.168.10.4) instead of the planned 192.168.10.10. The forwarders on both Windows machines point at a fixed address, so I set a static IP in netplan.
+
+  ![Static IP in netplan](images/splunk-netplan-static-ip.png)
 
 ---
 
@@ -94,8 +124,8 @@ That query is the alert I would build next. The 4625 evidence itself isn't captu
 | Issue | What happened | Why it matters | Fix |
 |---|---|---|---|
 | Crowbar failed | It didn't iterate the wordlist and returned nothing | Lost time on tooling instead of the detection | Switched to Hydra. Test tools on a known-good target first |
-| Brute force evidence missing | No capture of the Hydra run or the 4625 events | The attack can't be checked against the logs from this repo | Re-run and capture the 4625 burst and the 4624 that follows |
-| No alerts built | Both attacks were found by searching after the fact, not by alerts | In a SOC, nobody is searching at the right moment | Save the 4625 threshold search above as an alert, and add one for PowerShell download cradles and encoded commands |
+| Failed logons not captured | The successful 4624 is evidenced, but not the 4625 burst before it or the Hydra command | Without the failures, the logon alone looks like a user signing in from an odd machine. The pattern is what proves a brute force | Re-run and capture the 4625 burst followed by the 4624 |
+| No alerts built | Both attacks were found by searching after the fact | In a SOC, nobody is searching at the right moment | Save the brute force search above as an alert, and add one for PowerShell download cradles and encoded commands |
 
 ---
 
@@ -109,4 +139,4 @@ That query is the alert I would build next. The 4625 evidence itself isn't captu
 
 **Tools:** Windows Server 2022, Active Directory, Splunk Enterprise, Splunk Universal Forwarder, Sysmon, Kali Linux, Crowbar, Hydra, Atomic Red Team, VirtualBox
 
-**Frameworks:** MITRE ATT&CK T1110.001 (Password Guessing), T1059.001 (PowerShell)
+**Frameworks:** MITRE ATT&CK T1110.001 (Password Guessing), T1078.002 (Valid Accounts: Domain Accounts), T1059.001 (PowerShell)
